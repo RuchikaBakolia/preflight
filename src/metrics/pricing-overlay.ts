@@ -50,6 +50,16 @@ export function normalizeModelId(raw: string): string {
   return id.replace(PROVIDER_PREFIX_RE, '');
 }
 
+const ZERO_COST: CostBreakdown = {
+  inputUsd: 0,
+  outputUsd: 0,
+  thinkingUsd: 0,
+  cacheReadUsd: 0,
+  cacheCreationUsd: 0,
+  totalUsd: 0,
+  savingsFromCacheUsd: 0,
+};
+
 let pricingAliases: ReadonlyMap<string, string> = new Map();
 
 function lookupAlias(id: string): string | undefined {
@@ -61,12 +71,35 @@ function canonicalModelId(raw: string): string {
   return lookupAlias(raw.trim()) ?? lookupAlias(normalized) ?? normalized;
 }
 
-/** Every Preflight-side pricing lookup goes through here, never `resolveModelPricing` directly. */
+// Model ids arrive from transcripts and MCP tool input, so the memo is capped
+// rather than trusting the set of ids to stay small.
+const MAX_MEMOIZED_MODELS = 512;
+const pricingMemo = new Map<string, ModelPricing | null>();
+
+/** Drops memoized lookups; call after anything changes the pricing table or aliases. */
+export function clearPricingMemo(): void {
+  pricingMemo.clear();
+}
+
+/**
+ * Every Preflight-side pricing lookup goes through here, never `resolveModelPricing` directly.
+ * Memoized per model id (`null` = unpriced) so the vendored resolver's "Unknown model"
+ * warning fires once per process rather than once per token event.
+ */
 export function resolvePricing(model: string): ModelPricing | null {
-  return resolveModelPricing(canonicalModelId(model));
+  const cached = pricingMemo.get(model);
+  if (cached !== undefined) return cached;
+  const pricing = resolveModelPricing(canonicalModelId(model));
+  if (pricingMemo.size >= MAX_MEMOIZED_MODELS) {
+    const oldest = pricingMemo.keys().next();
+    if (!oldest.done) pricingMemo.delete(oldest.value);
+  }
+  pricingMemo.set(model, pricing);
+  return pricing;
 }
 
 export function calculateModelCost(model: string, usage: TokenUsage): CostBreakdown {
+  if (!resolvePricing(model)) return { ...ZERO_COST };
   return calculateCost(canonicalModelId(model), usage);
 }
 
@@ -110,6 +143,7 @@ export function applyGapFilledOverlay(overlayPath: string): void {
   if (Object.keys(gaps).length === 0) return;
 
   initPricingFromEntries(gaps);
+  clearPricingMemo();
 }
 
 function initPricingFromEntries(entries: Record<string, unknown>): void {
@@ -202,6 +236,14 @@ function applyCustomPricingFile(path: string): void {
  * build (YAGNI unless requested).
  */
 export function applyPricingOverlay(customPricingFile: string | null): void {
+  try {
+    applyPricingOverlayUncached(customPricingFile);
+  } finally {
+    clearPricingMemo();
+  }
+}
+
+function applyPricingOverlayUncached(customPricingFile: string | null): void {
   pricingAliases = new Map();
   if (customPricingFile) {
     applyCustomPricingFile(customPricingFile);

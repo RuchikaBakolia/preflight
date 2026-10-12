@@ -1,12 +1,14 @@
-import { afterEach, describe, expect, it } from '@jest/globals';
+import { afterEach, beforeEach, describe, expect, it, jest } from '@jest/globals';
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { initPricing, resolveModelPricing } from '../shared/pricing.js';
+import { calculateCost, initPricing, resolveModelPricing } from '../shared/pricing.js';
+import { makeUsage } from '../__test-utils__/token-usage.js';
 import {
   applyGapFilledOverlay,
   applyPricingOverlay,
   calculateModelCost,
+  clearPricingMemo,
   normalizeModelId,
   resolvePricing,
   resolvePricingOverlayPath,
@@ -211,5 +213,86 @@ describe('model pricing through the boundary', () => {
     applyPricingOverlay(writePricing({ aliases: { 'gw-claude-sonnet': 'claude-sonnet-4-6' } }));
     applyPricingOverlay(null);
     expect(resolvePricing('gw-claude-sonnet')).toBeNull();
+  });
+});
+
+describe('pricing memo', () => {
+  const USAGE = makeUsage({ inputTokens: 10_000, outputTokens: 2_000, totalTokens: 12_000 });
+  let consoleError: jest.SpiedFunction<typeof console.error>;
+  let dir: string | null = null;
+
+  const loggedText = (): string => consoleError.mock.calls.map((c) => String(c[0])).join('\n');
+  const unknownWarnings = (): number =>
+    loggedText().split('Unknown model, pricing not available').length - 1;
+
+  beforeEach(() => {
+    consoleError = jest.spyOn(console, 'error').mockImplementation(() => undefined);
+  });
+
+  afterEach(() => {
+    consoleError.mockRestore();
+    initPricing(null);
+    clearPricingMemo();
+    if (dir) rmSync(dir, { recursive: true, force: true });
+    dir = null;
+  });
+
+  it('warns about an unknown model once, however often it is looked up or priced', () => {
+    for (let i = 0; i < 5; i++) {
+      resolvePricing('claude-foo-9-9');
+      calculateModelCost('claude-foo-9-9', USAGE);
+    }
+    expect(unknownWarnings()).toBe(1);
+  });
+
+  it('prices an unknown model at zero', () => {
+    expect(calculateModelCost('claude-foo-9-9', USAGE).totalUsd).toBe(0);
+  });
+
+  it('prices a bundled model the same as the vendored calculateCost', () => {
+    expect(calculateModelCost('claude-sonnet-5', USAGE)).toEqual(
+      calculateCost('claude-sonnet-5', USAGE),
+    );
+    expect(resolvePricing('claude-sonnet-5[1m]')).not.toBeNull();
+  });
+
+  it('re-resolves after the overlay changes the table', () => {
+    expect(resolvePricing('claude-foo-9-9')).toBeNull();
+
+    dir = mkdtempSync(join(tmpdir(), 'preflight-pricing-memo-'));
+    const overlayPath = join(dir, 'pricing.json');
+    writeFileSync(
+      overlayPath,
+      JSON.stringify({
+        'claude-foo-9-9': { inputPerMTok: 1, outputPerMTok: 2, contextWindow: 100_000 },
+      }),
+      { mode: 0o600 },
+    );
+    applyGapFilledOverlay(overlayPath);
+
+    expect(resolvePricing('claude-foo-9-9')?.contextWindow).toBe(100_000);
+  });
+
+  it('re-resolves after a custom pricing file changes the aliases', () => {
+    expect(resolvePricing('gw-claude-sonnet')).toBeNull();
+    dir = mkdtempSync(join(tmpdir(), 'preflight-pricing-memo-'));
+    const file = join(dir, 'pricing.json');
+    writeFileSync(file, JSON.stringify({ aliases: { 'gw-claude-sonnet': 'claude-sonnet-4-6' } }));
+    applyPricingOverlay(file);
+    expect(resolvePricing('gw-claude-sonnet')).not.toBeNull();
+  });
+
+  it('evicts the oldest entry at the cap instead of dropping the whole memo', () => {
+    resolvePricing('claude-sonnet-5');
+    resolveModelPricing('claude-sonnet-5');
+    for (let i = 0; i < 511; i++) resolvePricing(`claude-unknown-${i}`);
+    consoleError.mockClear();
+
+    // Cap is 512: this evicts claude-sonnet-5 (oldest) only, so an earlier
+    // unknown id is still memoized and does not warn again.
+    resolvePricing('claude-unknown-new');
+    consoleError.mockClear();
+    resolvePricing('claude-unknown-5');
+    expect(unknownWarnings()).toBe(0);
   });
 });
