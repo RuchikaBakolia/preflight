@@ -13,6 +13,7 @@ import {
 import type { FullSessionSummary } from './session-store.js';
 import type { SessionTracker } from '../metrics/session-tracker.js';
 import { CostTracker } from '../metrics/cost-tracker.js';
+import { buildCostTrackerSeed } from '../metrics/cost-tracker-seed.js';
 import type { CostMetrics } from '../metrics/cost-tracker.js';
 import type { TaskDetector } from '../metrics/task-detector.js';
 import type { AntiPatternDetector } from '../metrics/anti-patterns.js';
@@ -1652,6 +1653,145 @@ describe('buildSessionSummary', () => {
       estimatedByModel: [1],
     } as unknown as Record<string, unknown>);
     expect(none.estimatedByModel).toBeUndefined();
+  });
+
+  it('mergeSummaries lets the incoming byteEstimates replace the existing ledger instead of taking the max', () => {
+    const ledger = (costUsd: number) => ({
+      costUsd,
+      inputTokens: 0,
+      outputTokens: 0,
+      costByModel: {},
+      costByDayUsd: {},
+    });
+    const existing = makeSummary({ byteEstimates: ledger(0.5) });
+
+    expect(
+      mergeSummaries(existing, makeSummary({ byteEstimates: ledger(0) })).byteEstimates,
+    ).toEqual(ledger(0));
+    expect(mergeSummaries(existing, makeSummary()).byteEstimates).toEqual(ledger(0.5));
+    expect(mergeSummaries(makeSummary(), makeSummary()).byteEstimates).toBeUndefined();
+  });
+
+  describe('a checkpoint written before the first real report', () => {
+    const MODEL = 'claude-sonnet-4';
+    const usage = {
+      inputTokens: 1_000,
+      outputTokens: 500,
+      thinkingTokens: 0,
+      cacheReadTokens: 0,
+      cacheCreationTokens: 0,
+      totalTokens: 1_500,
+    };
+
+    function checkpoint(store: SessionStore, tracker: CostTracker, sessionId: string): void {
+      const m = tracker.getMetrics();
+      store.saveSession(
+        makeSummary({
+          sessionId,
+          startTime: 1_700_000_000_000,
+          estimatedCostUsd: m.sessionTotalCostUsd,
+          costByDayUsd: m.costByDayUsd,
+          tokensInput: m.totalInputTokens,
+          tokensOutput: m.totalOutputTokens,
+          ...(m.byteEstimates && { byteEstimates: m.byteEstimates }),
+        }),
+      );
+    }
+
+    it('does not keep the estimate on disk once the real report shrinks the total', () => {
+      const store = new SessionStore({ storagePath: tmpDir });
+      const tracker = new CostTracker();
+      for (let i = 0; i < 5; i++) tracker.recordEstimatedTokens(40_000, 20_000, MODEL);
+      checkpoint(store, tracker, 'sess-shrink');
+
+      const exact = tracker.recordTokenUsage(usage, MODEL, { replacesEstimates: true });
+      checkpoint(store, tracker, 'sess-shrink');
+
+      const onDisk = store.loadSession('sess-shrink');
+      expect(onDisk?.estimatedCostUsd).toBeCloseTo(exact.totalUsd, 9);
+      expect(onDisk?.tokensInput).toBe(1_000);
+      expect(onDisk?.tokensOutput).toBe(500);
+      expect(Object.values(onDisk?.costByDayUsd ?? {}).reduce((a, b) => a + b, 0)).toBeCloseTo(
+        exact.totalUsd,
+        9,
+      );
+
+      const restarted = new CostTracker();
+      restarted.seedFromPersisted(buildCostTrackerSeed(onDisk as FullSessionSummary));
+      expect(restarted.getMetrics().sessionTotalCostUsd).toBeCloseTo(exact.totalUsd, 9);
+    });
+
+    it("keeps another writer's larger exact total when the ledger shrinks", () => {
+      const store = new SessionStore({ storagePath: tmpDir });
+      const tracker = new CostTracker();
+      for (let i = 0; i < 5; i++) tracker.recordEstimatedTokens(40_000, 20_000, MODEL);
+      checkpoint(store, tracker, 'sess-other');
+      store.saveSession(
+        makeSummary({
+          sessionId: 'sess-other',
+          startTime: 1_700_000_000_000,
+          estimatedCostUsd: 0.2,
+          tokensInput: 9_000,
+          tokensOutput: 4_000,
+        }),
+      );
+
+      tracker.recordTokenUsage(usage, MODEL, { replacesEstimates: true });
+      checkpoint(store, tracker, 'sess-other');
+
+      const onDisk = store.loadSession('sess-other');
+      expect(onDisk?.estimatedCostUsd).toBeCloseTo(0.2, 9);
+      expect(onDisk?.tokensInput).toBe(9_000);
+      expect(onDisk?.tokensOutput).toBe(4_000);
+    });
+
+    it('keeps growing past the shrunk total as later exact reports arrive', () => {
+      const store = new SessionStore({ storagePath: tmpDir });
+      const tracker = new CostTracker();
+      tracker.recordEstimatedTokens(40_000, 20_000, MODEL);
+      checkpoint(store, tracker, 'sess-grow');
+      tracker.recordTokenUsage(usage, MODEL, { replacesEstimates: true });
+      checkpoint(store, tracker, 'sess-grow');
+      const second = tracker.recordTokenUsage(usage, MODEL, { replacesEstimates: true });
+      checkpoint(store, tracker, 'sess-grow');
+
+      expect(store.loadSession('sess-grow')?.estimatedCostUsd).toBeCloseTo(
+        tracker.getMetrics().sessionTotalCostUsd ?? 0,
+        9,
+      );
+      expect(second.totalUsd).toBeGreaterThan(0);
+    });
+  });
+
+  it('deserializeFullSessionSummary keeps only well-formed byteEstimates fields', () => {
+    const raw = {
+      sessionId: 'sess-byte-estimates',
+      startTime: 1_700_000_000_000,
+      endTime: 1_700_003_600_000,
+      durationMs: 3_600_000,
+      toolCallCount: 5,
+      developer: 'dev',
+      byteEstimates: {
+        costUsd: 0.25,
+        inputTokens: 'bad',
+        outputTokens: 40,
+        costByModel: { a: 0.25, b: 'nope' },
+        costByDayUsd: [1],
+      },
+    };
+    const result = deserializeFullSessionSummary(raw as unknown as Record<string, unknown>);
+    expect(result.byteEstimates).toEqual({
+      costUsd: 0.25,
+      inputTokens: 0,
+      outputTokens: 40,
+      costByModel: { a: 0.25 },
+      costByDayUsd: {},
+    });
+    const none = deserializeFullSessionSummary({
+      ...raw,
+      byteEstimates: 'x',
+    } as unknown as Record<string, unknown>);
+    expect(none.byteEstimates).toBeUndefined();
   });
 
   it('mergeSummaries unions timeline entries from both sides instead of keeping only the longer array', () => {

@@ -49,7 +49,10 @@ import { SessionResumeTracker } from './metrics/session-resume-tracker.js';
 import { BudgetTracker } from './metrics/budget-tracker.js';
 import { ClaudeMdTracker } from './metrics/claudemd-tracker.js';
 import { CollaborationProfiler } from './metrics/collaboration-profile.js';
-import { shouldApplyCostEstimate } from './metrics/cost-estimate-gate.js';
+import {
+  isTokenEventForThisProcess,
+  shouldApplyCostEstimate,
+} from './metrics/cost-estimate-gate.js';
 import { ContextCompositionTracker } from './metrics/context-composition-tracker.js';
 import { ContextTrackerRegistry } from './metrics/context-tracker.js';
 import { ContextWindowTracker } from './metrics/context-window-tracker.js';
@@ -103,7 +106,7 @@ import type { ProxyRequestRecord, ProxyToolCallRecord } from './proxy/index.js';
 import { ProxyManager } from './proxy/index.js';
 import { AuditTrailManager } from './security/audit-trail.js';
 import { createServer } from './server.js';
-import type { TokenUsage } from './shared/index.js';
+import type { CostBreakdown, TokenUsage } from './shared/index.js';
 import { createLogger } from './shared/index.js';
 import { LocalStore } from './storage/index.js';
 import { purgeOldSessions, purgeOldWeeklySummaries } from './storage/retention.js';
@@ -2346,8 +2349,18 @@ async function main(): Promise<void> {
       },
       onTokenEvent: (tokenEvent) => {
         if (!costTracker || !config) return;
+        // A --stdio engine's CostTracker total is persisted as its own
+        // session's cost and its AiTurnCost events carry its own session id, so
+        // another session's tokens (drained while the id is still provisional)
+        // are priced for that session's rollup only. --local owns no single
+        // session and keeps folding everything.
+        const isOwnEvent = isTokenEventForThisProcess({
+          stdio: options.stdio === true,
+          eventSessionId: tokenEvent.sessionId ?? null,
+          ownSessionId: sessionTraceId,
+        });
         const closedTurn = turnCostAttributor.recordTokenEvent(tokenEvent);
-        if (closedTurn) capturedNrIngest?.ingestTurnCost(closedTurn);
+        if (closedTurn && isOwnEvent) capturedNrIngest?.ingestTurnCost(closedTurn);
         const usage = {
           inputTokens: tokenEvent.inputTokens,
           outputTokens: tokenEvent.outputTokens,
@@ -2356,11 +2369,17 @@ async function main(): Promise<void> {
           cacheCreationTokens: tokenEvent.cacheCreationTokens,
           totalTokens: tokenEvent.inputTokens + tokenEvent.outputTokens,
         };
-        const breakdown = costTracker.recordTokenUsage(usage, tokenEvent.model, {
-          timestampMs: tokenEvent.timestamp,
-          ...(tokenEvent.responseMs !== undefined && { responseMs: tokenEvent.responseMs }),
-        });
-        modelUsageTracker.recordUsage(tokenEvent.model, usage, breakdown.totalUsd);
+        let breakdown: CostBreakdown;
+        if (!isOwnEvent) {
+          breakdown = costTracker.priceUsage(usage, tokenEvent.model);
+        } else {
+          breakdown = costTracker.recordTokenUsage(usage, tokenEvent.model, {
+            timestampMs: tokenEvent.timestamp,
+            replacesEstimates: true,
+            ...(tokenEvent.responseMs !== undefined && { responseMs: tokenEvent.responseMs }),
+          });
+          modelUsageTracker.recordUsage(tokenEvent.model, usage, breakdown.totalUsd);
+        }
         localSessionAggregator.recordTokenUsage(tokenEvent.sessionId, {
           timestamp: tokenEvent.timestamp,
           costUsd: breakdown.totalUsd,
